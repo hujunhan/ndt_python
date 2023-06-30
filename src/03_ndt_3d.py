@@ -6,6 +6,18 @@ from scipy.spatial.transform import Rotation as R
 import pickle
 import os
 import time
+import scipy
+
+# Parameters
+outlier_ratio = 0.55
+resolution = 1.0
+gauss_c1 = 10.0 * (1 - outlier_ratio)
+gauss_c2 = outlier_ratio / np.power(resolution, 3)
+gauss_d3 = -np.log(gauss_c2)
+gauss_d1 = -np.log(gauss_c1 + gauss_c2) - gauss_d3
+guass_d2 = -2 * np.log(
+    (-np.log(gauss_c1 * np.exp(-0.5) + gauss_c2) - gauss_d3) / gauss_d1
+)
 
 
 def voxelization(point_cloud, voxel_size):
@@ -29,13 +41,18 @@ def voxelization(point_cloud, voxel_size):
     voxel_gaussians = {}
     for voxel_index, points in voxel_dict.items():
         points = np.asarray(points)
+        if len(points) < 5:
+            # delete the voxel with less than 5 points
+            voxel_dict.pop(voxel_index)
+            continue
         mean = np.mean(points, axis=0)
         cov = np.cov(points, rowvar=False)
+        cov_inv = np.linalg.inv(cov)
         if points.shape[0] == 1:
             cov = (
                 np.eye(3) * cov
             )  # If only one point in voxel, use the variance as the diagonal of a 3x3 covariance matrix
-        voxel_gaussians[voxel_index] = (mean, cov)
+        voxel_gaussians[voxel_index] = (mean, cov_inv)
 
     return voxel_gaussians
 
@@ -52,7 +69,7 @@ def get_c_s_from_x(x):
         return np.cos(x), np.sin(x)
 
 
-def jac(pose, point):
+def first_deriv(pose, point):
     """the jacobian would be the sum of the jacobian of each point
 
     Args:
@@ -87,7 +104,7 @@ def jac(pose, point):
     return J_e
 
 
-def hessian(pose, point):
+def second_deriv(pose, point):
     """the hessian would be the sum of the hessian of each point
 
     Args:
@@ -125,11 +142,11 @@ def hessian(pose, point):
     H_e[10:12, 5] = hessian_mean[4:6]
     H_e[12:15, 5] = hessian_mean[9:12]
     H_e[15:18, 5] = hessian_mean[12:15]
-    print(f"hessian_mean: \n{H_e}")
-    return hessian_mean
+    # print(f"hessian_mean: \n{H_e}")
+    return H_e
 
 
-def objective_func(x, source, target_gauss, voxel_size=0.1):
+def objective_func(x, source, target_gauss, voxel_size):
     t1 = time.time()
     r = R.from_euler("zyx", x[3:6], degrees=False)
     rot_mat = r.as_matrix()
@@ -140,18 +157,23 @@ def objective_func(x, source, target_gauss, voxel_size=0.1):
         voxel_index = tuple(np.floor(p / voxel_size).astype(int))
         if voxel_index in target_gauss:
             in_voxel_points.append(p)
-            mean, cov = target_gauss[voxel_index]
-            if np.linalg.matrix_rank(cov) < 3:
+            mean, cov_inv = target_gauss[voxel_index]
+            if np.linalg.matrix_rank(cov_inv) < 3:
                 continue
-            cost += (p - mean) @ np.linalg.inv(cov) @ (p - mean)
+            cost += gauss_d1 * np.exp(-guass_d2 * (p - mean) @ cov_inv @ (p - mean))
     in_voxel_points = np.asarray(in_voxel_points)
-    jac_val = jac(x, in_voxel_points)
-    hessian_val = hessian(x, in_voxel_points)
+    jac_val = first_deriv(x, in_voxel_points)
+    hessian_val = second_deriv(x, in_voxel_points)
+    hessian_inv = np.linalg.pinv(hessian_val)
+    res = np.matmul(hessian_inv, jac_val.reshape((18, 1)))
+    # res = np.linalg.lstsq(hessian_val, jac_val.reshape((18, 1)), rcond=None)[0]
+
+    print(f"res: {res}")
     t2 = time.time()
     print(f"cost: {cost}, time: {t2-t1}")
-    print(f"x: {x}")
-    print(f"jac: {jac_val}")
-    return cost
+    # print(f"x: {x}")
+    # print(f"jac: {jac_val}")
+    return res
 
 
 def ndt(source, target, voxel_size=0.1):
@@ -167,12 +189,16 @@ def ndt(source, target, voxel_size=0.1):
     t2 = time.time()
     print("voxelization time: ", t2 - t1)
     # Registration
-    init_guess = np.zeros(6)  # x, y, z, roll, pitch, yaw
+    init_guess = np.asarray([1, 1, 0, 0, 0, 0])  # x, y, z, roll, pitch, yaw
+    res = np.zeros((6, 1))
     # https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html
     # 2. Score Computation
     # 3. Jacobian Computation
     # 4. Optimization, manually update the transformation, calculate the jac and hessian analytically
-    objective_func(init_guess, source, target_gauss, voxel_size)
+    for _ in range(10):
+        res = objective_func(init_guess, source, target_gauss, voxel_size)
+        init_guess = init_guess + res.reshape((6,))
+
     # 5. Transformation Update
 
 
@@ -194,4 +220,4 @@ if __name__ == "__main__":
     # source_pt = np.hstack((source_pt, np.ones((source_pt.shape[0], 1))))
     # target_pt = np.hstack((target_pt, np.ones((target_pt.shape[0], 1))))
 
-    ndt(source_pt, target_pt)
+    ndt(source_pt, target_pt, 1.0)
