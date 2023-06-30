@@ -15,7 +15,7 @@ gauss_c1 = 10.0 * (1 - outlier_ratio)
 gauss_c2 = outlier_ratio / np.power(resolution, 3)
 gauss_d3 = -np.log(gauss_c2)
 gauss_d1 = -np.log(gauss_c1 + gauss_c2) - gauss_d3
-guass_d2 = -2 * np.log(
+gauss_d2 = -2 * np.log(
     (-np.log(gauss_c1 * np.exp(-0.5) + gauss_c2) - gauss_d3) / gauss_d1
 )
 
@@ -142,6 +142,7 @@ def second_deriv(pose, point):
     H_e[10:12, 5] = hessian_mean[4:6]
     H_e[12:15, 5] = hessian_mean[9:12]
     H_e[15:18, 5] = hessian_mean[12:15]
+    H_e = H_e.reshape(6, 6, 3)
     # print(f"hessian_mean: \n{H_e}")
     return H_e
 
@@ -153,17 +154,46 @@ def objective_func(x, source, target_gauss, voxel_size):
     transformed_points = source @ rot_mat.T + x[:3]
     cost = 0.0
     in_voxel_points = []
+    g = np.zeros((6, 1))
+    h = np.zeros((6, 6))
     for p in transformed_points:
         voxel_index = tuple(np.floor(p / voxel_size).astype(int))
         if voxel_index in target_gauss:
             in_voxel_points.append(p)
             mean, cov_inv = target_gauss[voxel_index]
+            first_d = first_deriv(x, p)
+            second_d = second_deriv(x, p)
             if np.linalg.matrix_rank(cov_inv) < 3:
                 continue
-            cost += gauss_d1 * np.exp(-guass_d2 * (p - mean) @ cov_inv @ (p - mean))
+            ## Update g and H in equation 6.11 and 6.12
+            x_trans = p - mean
+            e_x_cov_x = np.exp(-gauss_d2 * x_trans @ cov_inv @ x_trans)  # reuseable
+            if e_x_cov_x > 1 or e_x_cov_x < 0:  ## error cheching
+                continue
+            cost += -gauss_d1 * e_x_cov_x  # cost equation 6.9
+            e_x_cov_x = e_x_cov_x * gauss_d2 * gauss_d1
+            for i in range(6):
+                cov_dxd_pi = cov_inv @ first_d[i]
+                g[i] += x_trans @ cov_dxd_pi * e_x_cov_x
+                for j in range(6):
+                    h[i, j] += (
+                        e_x_cov_x
+                        * (
+                            -gauss_d1
+                            * x_trans
+                            @ cov_dxd_pi
+                            * x_trans
+                            @ (cov_inv * first_d[j])
+                        )
+                        + x_trans
+                        @ (cov_inv * second_d[3 * i : 3 * (i + 1), j])
+                        * e_x_cov_x
+                        + first_d[j] @ cov_dxd_pi
+                    )
     in_voxel_points = np.asarray(in_voxel_points)
     jac_val = first_deriv(x, in_voxel_points)
     hessian_val = second_deriv(x, in_voxel_points)
+    print(hessian_val)
     hessian_inv = np.linalg.pinv(hessian_val)
     res = np.matmul(hessian_inv, jac_val.reshape((18, 1)))
     # res = np.linalg.lstsq(hessian_val, jac_val.reshape((18, 1)), rcond=None)[0]
